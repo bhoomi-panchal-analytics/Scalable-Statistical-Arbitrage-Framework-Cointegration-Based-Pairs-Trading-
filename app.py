@@ -1,116 +1,96 @@
 import streamlit as st
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from util import (
-    load_price_data,
-    scan_cointegrated_pairs,
-    estimate_hedge_ratio,
-    compute_spread,
-    compute_zscore,
-    generate_signals,
-    backtest,
+import yfinance as yf
+
+# ----------------------------------
+# USER INPUT SECTION
+# ----------------------------------
+
+st.sidebar.header("Universe Selection")
+
+input_mode = st.sidebar.radio(
+    "Select Input Mode",
+    ["Manual Input", "Predefined US Banks"]
 )
 
-st.set_page_config(layout="wide")
-st.title("Statistical Arbitrage – Cointegration Framework")
+if input_mode == "Manual Input":
+    tickers_input = st.sidebar.text_input(
+        "Enter tickers (comma separated)",
+        "JPM,BAC,C,GS,MS"
+    )
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip() != ""]
 
-# Sidebar
-st.sidebar.header("Configuration")
+else:
+    tickers = ["JPM", "BAC", "C", "GS", "MS"]
+    st.sidebar.write("Universe: US Major Banks")
 
-tickers_input = st.sidebar.text_input(
-    "Enter tickers (comma separated)", "JPM,BAC,C,GS,MS"
-)
+# ----------------------------------
+# SANITIZATION & VALIDATION
+# ----------------------------------
 
-start_date = st.sidebar.date_input(
-    "Start Date", pd.to_datetime("2015-01-01")
-)
+def validate_tickers(ticker_list):
+    valid = []
+    invalid = []
 
-p_threshold = st.sidebar.slider("Cointegration p-value", 0.01, 0.1, 0.05)
-z_threshold = st.sidebar.slider("Z-score Threshold", 1.0, 3.0, 2.0)
+    for ticker in ticker_list:
+        try:
+            data = yf.Ticker(ticker).history(period="5d")
+            if not data.empty:
+                valid.append(ticker)
+            else:
+                invalid.append(ticker)
+        except Exception:
+            invalid.append(ticker)
 
-tickers = [t.strip().upper() for t in tickers_input.split(",")]
+    return valid, invalid
 
-@st.cache_data
-def load_data_cached(tickers, start_date):
-    return load_price_data(tickers, str(start_date))
 
-data = load_data_cached(tickers, start_date)
+if st.sidebar.button("Validate Tickers"):
+    valid, invalid = validate_tickers(tickers)
 
-if data.shape[0] < 250:
-    st.error("Minimum 250 observations required.")
-    st.stop()
+    if invalid:
+        st.sidebar.warning(f"Invalid Tickers Removed: {invalid}")
 
-# ---------------------------
-# PAIR SCANNER
-# ---------------------------
+    if len(valid) < 2:
+        st.error("Minimum 2 valid tickers required.")
+        st.stop()
 
-st.subheader("Cointegrated Pairs")
-pairs_df = scan_cointegrated_pairs(data, p_threshold)
+    st.session_state["tickers"] = valid
+    st.success(f"Validated Universe: {valid}")
 
-if pairs_df.empty:
-    st.warning("No cointegrated pairs found.")
-    st.stop()
+# ----------------------------------
+# LOAD DATA BUTTON
+# ----------------------------------
 
-st.dataframe(pairs_df)
+if "tickers" in st.session_state:
+    start_date = st.sidebar.date_input(
+        "Start Date",
+        pd.to_datetime("2015-01-01")
+    )
 
-selected_pair = st.selectbox(
-    "Select Pair",
-    pairs_df.apply(lambda row: f"{row['Stock1']} - {row['Stock2']}", axis=1)
-)
+    if st.sidebar.button("Load Data"):
+        data = yf.download(
+            st.session_state["tickers"],
+            start=str(start_date),
+            auto_adjust=True,
+            progress=False
+        )["Close"]
 
-stock1, stock2 = selected_pair.split(" - ")
+        data = data.dropna(how="all")
 
-y = data[stock1]
-x = data[stock2]
+        if data.shape[0] < 250:
+            st.error("Not enough historical data (minimum 250 observations).")
+            st.stop()
 
-beta = estimate_hedge_ratio(y, x)
-spread = compute_spread(y, x, beta)
-zscore = compute_zscore(spread)
-signals = generate_signals(zscore, z_threshold)
-cum_returns, drawdown, sharpe = backtest(spread, signals)
+        st.session_state["data"] = data
+        st.success("Data Loaded Successfully")
 
-st.metric("Sharpe Ratio", round(sharpe, 3))
+# ----------------------------------
+# DISPLAY DATA SUMMARY
+# ----------------------------------
 
-# ---------------------------
-# 10 GRAPHS
-# ---------------------------
-
-# 1 Price
-st.plotly_chart(px.line(data[[stock1, stock2]], title="Price Series"), use_container_width=True)
-
-# 2 Spread
-st.plotly_chart(px.line(spread, title="Spread"), use_container_width=True)
-
-# 3 Z-score
-fig_z = go.Figure()
-fig_z.add_trace(go.Scatter(x=zscore.index, y=zscore))
-fig_z.add_hline(y=z_threshold)
-fig_z.add_hline(y=-z_threshold)
-fig_z.update_layout(title="Z-score")
-st.plotly_chart(fig_z, use_container_width=True)
-
-# 4 Rolling Correlation
-rolling_corr = y.rolling(60).corr(x)
-st.plotly_chart(px.line(rolling_corr, title="Rolling 60-Day Correlation"), use_container_width=True)
-
-# 5 Cumulative Returns
-st.plotly_chart(px.line(cum_returns, title="Cumulative Returns"), use_container_width=True)
-
-# 6 Drawdown
-st.plotly_chart(px.area(drawdown, title="Drawdown"), use_container_width=True)
-
-# 7 Histogram Spread
-st.plotly_chart(px.histogram(spread, nbins=50, title="Spread Distribution"), use_container_width=True)
-
-# 8 Rolling Sharpe
-rolling_sharpe = signals["position"].shift(1) * spread.pct_change()
-rolling_sharpe = rolling_sharpe.rolling(60).mean() / rolling_sharpe.rolling(60).std()
-st.plotly_chart(px.line(rolling_sharpe, title="Rolling Sharpe"), use_container_width=True)
-
-# 9 Position Exposure
-st.plotly_chart(px.line(signals["position"], title="Position Exposure"), use_container_width=True)
-
-# 10 Coint Heatmap
-pivot = pairs_df.pivot(index="Stock1", columns="Stock2", values="p-value")
-st.plotly_chart(px.imshow(pivot, title="Cointegration P-Value Heatmap"), use_container_width=True)
+if "data" in st.session_state:
+    st.subheader("Data Summary")
+    st.write("Tickers:", st.session_state["data"].columns.tolist())
+    st.write("Observations:", len(st.session_state["data"]))
+    st.dataframe(st.session_state["data"].tail())

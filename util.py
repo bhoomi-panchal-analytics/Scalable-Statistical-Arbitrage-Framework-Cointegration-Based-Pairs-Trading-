@@ -1,96 +1,56 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
-from itertools import combinations
-from statsmodels.tsa.stattools import coint
 import statsmodels.api as sm
 
 
-# ---------------------------
-# DATA LOADER
-# ---------------------------
-
-def load_price_data(tickers, start="2015-01-01"):
-    data = yf.download(tickers, start=start, auto_adjust=True, progress=False)
-    data = data["Close"]
-    data = data.dropna(how="all")
-    return data
-
-
-# ---------------------------
-# COINTEGRATION SCAN
-# ---------------------------
-
-def scan_cointegrated_pairs(price_df, p_threshold=0.05):
-    results = []
-    tickers = price_df.columns
-
-    for t1, t2 in combinations(tickers, 2):
-        s1 = price_df[t1].dropna()
-        s2 = price_df[t2].dropna()
-        df = pd.concat([s1, s2], axis=1).dropna()
-
-        if len(df) < 250:
-            continue
-
-        score, pvalue, _ = coint(df.iloc[:, 0], df.iloc[:, 1])
-
-        if pvalue < p_threshold:
-            results.append((t1, t2, pvalue))
-
-    return pd.DataFrame(results, columns=["Stock1", "Stock2", "p-value"]).sort_values("p-value")
+def rolling_beta(y, x, window=60):
+    betas = []
+    for i in range(window, len(y)):
+        y_window = y.iloc[i-window:i]
+        x_window = x.iloc[i-window:i]
+        x_const = sm.add_constant(x_window)
+        model = sm.OLS(y_window, x_const).fit()
+        betas.append(model.params[1])
+    return pd.Series(betas, index=y.index[window:])
 
 
-# ---------------------------
-# HEDGE RATIO (OLS)
-# ---------------------------
+def calculate_half_life(spread):
+    spread_lag = spread.shift(1).dropna()
+    delta = spread.diff().dropna()
 
-def estimate_hedge_ratio(y, x):
-    x = sm.add_constant(x)
-    model = sm.OLS(y, x).fit()
-    beta = model.params[1]
-    return beta
+    spread_lag = spread_lag.loc[delta.index]
 
+    model = sm.OLS(delta, sm.add_constant(spread_lag)).fit()
+    lambda_coef = model.params[1]
 
-# ---------------------------
-# SPREAD + Z-SCORE
-# ---------------------------
-
-def compute_spread(y, x, beta):
-    spread = y - beta * x
-    return spread
+    half_life = -np.log(2) / lambda_coef
+    return half_life
 
 
-def compute_zscore(series):
-    return (series - series.mean()) / series.std()
+def calculate_hurst(ts):
+    lags = range(2, 20)
+    tau = [np.std(ts.diff(lag).dropna()) for lag in lags]
+    poly = np.polyfit(np.log(lags), np.log(tau), 1)
+    return poly[0] * 2.0
 
 
-# ---------------------------
-# SIGNAL GENERATION
-# ---------------------------
-
-def generate_signals(zscore, threshold=2.0):
-    signals = pd.DataFrame(index=zscore.index)
-    signals["long"] = zscore < -threshold
-    signals["short"] = zscore > threshold
-    signals["position"] = signals["long"].astype(int) - signals["short"].astype(int)
-    return signals
-
-
-# ---------------------------
-# BACKTEST ENGINE
-# ---------------------------
-
-def backtest(spread, signals):
-    returns = spread.pct_change().fillna(0)
-    strategy_returns = signals["position"].shift(1) * returns
-
+def performance_metrics(strategy_returns):
     cumulative = (1 + strategy_returns).cumprod()
     rolling_max = cumulative.cummax()
     drawdown = cumulative / rolling_max - 1
 
-    sharpe = (
-        strategy_returns.mean() / strategy_returns.std()
-    ) * np.sqrt(252)
+    sharpe = (strategy_returns.mean() / strategy_returns.std()) * np.sqrt(252)
 
-    return cumulative, drawdown, sharpe
+    downside = strategy_returns[strategy_returns < 0]
+    sortino = (strategy_returns.mean() / downside.std()) * np.sqrt(252)
+
+    cagr = cumulative.iloc[-1] ** (252 / len(strategy_returns)) - 1
+
+    max_dd = drawdown.min()
+
+    return {
+        "CAGR": cagr,
+        "Sharpe": sharpe,
+        "Sortino": sortino,
+        "Max Drawdown": max_dd
+    }

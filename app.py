@@ -1,6 +1,24 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+from util import rolling_beta, calculate_half_life, calculate_hurst, performance_metrics
+
+strategy_returns = signals["position"].shift(1) * spread.pct_change().fillna(0)
+
+metrics = performance_metrics(strategy_returns)
+half_life = calculate_half_life(spread)
+hurst = calculate_hurst(spread)
+
+st.subheader("Performance Metrics")
+col1, col2, col3, col4 = st.columns(4)
+
+col1.metric("CAGR", round(metrics["CAGR"], 4))
+col2.metric("Sharpe", round(metrics["Sharpe"], 3))
+col3.metric("Sortino", round(metrics["Sortino"], 3))
+col4.metric("Max Drawdown", round(metrics["Max Drawdown"], 3))
+
+st.metric("Half-Life (days)", round(half_life, 2))
+st.metric("Hurst Exponent", round(hurst, 3))
 
 # ----------------------------------
 # USER INPUT SECTION
@@ -84,6 +102,56 @@ if "tickers" in st.session_state:
 
         st.session_state["data"] = data
         st.success("Data Loaded Successfully")
+
+beta_roll = rolling_beta(y, x)
+
+st.plotly_chart(
+    px.line(beta_roll, title="Rolling Hedge Ratio (60-day)"),
+    use_container_width=True
+)
+
+
+rolling_vol = spread.pct_change().rolling(60).std() * np.sqrt(252)
+
+st.plotly_chart(
+    px.line(rolling_vol, title="Rolling Annualized Volatility of Spread"),
+    use_container_width=True
+)
+
+
+fig_trade = go.Figure()
+fig_trade.add_trace(go.Scatter(x=spread.index, y=spread, name="Spread"))
+
+long_entries = spread[signals["long"]]
+short_entries = spread[signals["short"]]
+
+fig_trade.add_trace(go.Scatter(
+    x=long_entries.index,
+    y=long_entries,
+    mode="markers",
+    marker=dict(symbol="triangle-up", size=8),
+    name="Long Entry"
+))
+
+fig_trade.add_trace(go.Scatter(
+    x=short_entries.index,
+    y=short_entries,
+    mode="markers",
+    marker=dict(symbol="triangle-down", size=8),
+    name="Short Entry"
+))
+
+fig_trade.update_layout(title="Trade Signals on Spread")
+
+st.plotly_chart(fig_trade, use_container_width=True)
+
+from statsmodels.graphics.tsaplots import plot_acf
+import matplotlib.pyplot as plt
+
+fig_acf, ax = plt.subplots()
+plot_acf(spread.dropna(), ax=ax, lags=40)
+st.pyplot(fig_acf)
+
 
 # ----------------------------------
 # DISPLAY DATA SUMMARY

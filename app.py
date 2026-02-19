@@ -1,10 +1,16 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
 import plotly.express as px
-from statsmodels.tsa.stattools import coint
-import yfinance as yf
+import plotly.graph_objects as go
+from util import (
+    load_price_data,
+    scan_cointegrated_pairs,
+    estimate_hedge_ratio,
+    compute_spread,
+    compute_zscore,
+    generate_signals,
+    backtest,
+)
 
 st.set_page_config(layout="wide")
 st.title("Statistical Arbitrage – Cointegration Framework")
@@ -12,76 +18,99 @@ st.title("Statistical Arbitrage – Cointegration Framework")
 # Sidebar
 st.sidebar.header("Configuration")
 
-ticker1 = st.sidebar.text_input("Stock 1", "JPM")
-ticker2 = st.sidebar.text_input("Stock 2", "BAC")
-start_date = st.sidebar.date_input("Start Date")
-z_threshold = st.sidebar.slider("Z-score Threshold", 1.0, 3.0, 2.0)
+tickers_input = st.sidebar.text_input(
+    "Enter tickers (comma separated)", "JPM,BAC,C,GS,MS"
+)
+
+start_date = st.sidebar.date_input(
+    "Start Date", pd.to_datetime("2015-01-01")
+)
+
 p_threshold = st.sidebar.slider("Cointegration p-value", 0.01, 0.1, 0.05)
+z_threshold = st.sidebar.slider("Z-score Threshold", 1.0, 3.0, 2.0)
 
-# Data Load
+tickers = [t.strip().upper() for t in tickers_input.split(",")]
+
 @st.cache_data
-def load_data(t1, t2):
-    data = yf.download([t1, t2], start="2018-01-01", auto_adjust=True)
-    data = data["Close"].dropna()
-    return data
+def load_data_cached(tickers, start_date):
+    return load_price_data(tickers, str(start_date))
 
-data = load_data(ticker1, ticker2)
+data = load_data_cached(tickers, start_date)
 
-# Cointegration
-score, pvalue, _ = coint(data[ticker1], data[ticker2])
-st.write(f"Cointegration p-value: {pvalue:.5f}")
+if data.shape[0] < 250:
+    st.error("Minimum 250 observations required.")
+    st.stop()
 
-if pvalue < p_threshold:
+# ---------------------------
+# PAIR SCANNER
+# ---------------------------
 
-    # OLS Hedge Ratio
-    beta = np.polyfit(data[ticker2], data[ticker1], 1)[0]
-    spread = data[ticker1] - beta * data[ticker2]
+st.subheader("Cointegrated Pairs")
+pairs_df = scan_cointegrated_pairs(data, p_threshold)
 
-    zscore = (spread - spread.mean()) / spread.std()
+if pairs_df.empty:
+    st.warning("No cointegrated pairs found.")
+    st.stop()
 
-    # GRAPH 1 – Price
-    fig1 = px.line(data, title="Price Series")
-    st.plotly_chart(fig1, use_container_width=True)
+st.dataframe(pairs_df)
 
-    # GRAPH 2 – Spread
-    fig2 = px.line(spread, title="Spread")
-    st.plotly_chart(fig2, use_container_width=True)
+selected_pair = st.selectbox(
+    "Select Pair",
+    pairs_df.apply(lambda row: f"{row['Stock1']} - {row['Stock2']}", axis=1)
+)
 
-    # GRAPH 3 – Z-score
-    fig3 = go.Figure()
-    fig3.add_trace(go.Scatter(x=zscore.index, y=zscore, name="Z-score"))
-    fig3.add_hline(y=z_threshold)
-    fig3.add_hline(y=-z_threshold)
-    fig3.update_layout(title="Z-score with Thresholds")
-    st.plotly_chart(fig3, use_container_width=True)
+stock1, stock2 = selected_pair.split(" - ")
 
-    # Signals
-    signals = pd.DataFrame(index=zscore.index)
-    signals["long"] = zscore < -z_threshold
-    signals["short"] = zscore > z_threshold
+y = data[stock1]
+x = data[stock2]
 
-    # Backtest
-    position = signals["long"].astype(int) - signals["short"].astype(int)
-    returns = spread.pct_change().fillna(0)
-    strategy_returns = position.shift(1) * returns
+beta = estimate_hedge_ratio(y, x)
+spread = compute_spread(y, x, beta)
+zscore = compute_zscore(spread)
+signals = generate_signals(zscore, z_threshold)
+cum_returns, drawdown, sharpe = backtest(spread, signals)
 
-    cum_returns = (1 + strategy_returns).cumprod()
+st.metric("Sharpe Ratio", round(sharpe, 3))
 
-    # GRAPH 4 – Cumulative Returns
-    fig4 = px.line(cum_returns, title="Cumulative Strategy Returns")
-    st.plotly_chart(fig4, use_container_width=True)
+# ---------------------------
+# 10 GRAPHS
+# ---------------------------
 
-    # GRAPH 5 – Drawdown
-    rolling_max = cum_returns.cummax()
-    drawdown = cum_returns / rolling_max - 1
-    fig5 = px.area(drawdown, title="Drawdown")
-    st.plotly_chart(fig5, use_container_width=True)
+# 1 Price
+st.plotly_chart(px.line(data[[stock1, stock2]], title="Price Series"), use_container_width=True)
 
-    # Add remaining graphs similarly:
-    # Rolling Sharpe
-    rolling_sharpe = strategy_returns.rolling(60).mean() / strategy_returns.rolling(60).std()
-    fig6 = px.line(rolling_sharpe, title="Rolling Sharpe Ratio")
-    st.plotly_chart(fig6, use_container_width=True)
+# 2 Spread
+st.plotly_chart(px.line(spread, title="Spread"), use_container_width=True)
 
-else:
-    st.warning("Pair not cointegrated under selected threshold.")
+# 3 Z-score
+fig_z = go.Figure()
+fig_z.add_trace(go.Scatter(x=zscore.index, y=zscore))
+fig_z.add_hline(y=z_threshold)
+fig_z.add_hline(y=-z_threshold)
+fig_z.update_layout(title="Z-score")
+st.plotly_chart(fig_z, use_container_width=True)
+
+# 4 Rolling Correlation
+rolling_corr = y.rolling(60).corr(x)
+st.plotly_chart(px.line(rolling_corr, title="Rolling 60-Day Correlation"), use_container_width=True)
+
+# 5 Cumulative Returns
+st.plotly_chart(px.line(cum_returns, title="Cumulative Returns"), use_container_width=True)
+
+# 6 Drawdown
+st.plotly_chart(px.area(drawdown, title="Drawdown"), use_container_width=True)
+
+# 7 Histogram Spread
+st.plotly_chart(px.histogram(spread, nbins=50, title="Spread Distribution"), use_container_width=True)
+
+# 8 Rolling Sharpe
+rolling_sharpe = signals["position"].shift(1) * spread.pct_change()
+rolling_sharpe = rolling_sharpe.rolling(60).mean() / rolling_sharpe.rolling(60).std()
+st.plotly_chart(px.line(rolling_sharpe, title="Rolling Sharpe"), use_container_width=True)
+
+# 9 Position Exposure
+st.plotly_chart(px.line(signals["position"], title="Position Exposure"), use_container_width=True)
+
+# 10 Coint Heatmap
+pivot = pairs_df.pivot(index="Stock1", columns="Stock2", values="p-value")
+st.plotly_chart(px.imshow(pivot, title="Cointegration P-Value Heatmap"), use_container_width=True)
